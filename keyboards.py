@@ -1,46 +1,37 @@
-from datetime import datetime, timedelta
-from telegram import InlineKeyboardButton
+"""Инлайн-календарь для выбора даты в Telegram."""
+import calendar
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 MONTHS_RU = [
     "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
-    "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"
+    "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
 ]
-
 WEEKDAYS_RU = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
 
-def build_calendar(year, month, prefix):
-    """Build inline calendar keyboard"""
-    keyboard = []
+def build_calendar(year: int, month: int, prefix: str) -> InlineKeyboardMarkup:
+    """prefix — "start" или "end", чтобы отличать календарь начальной/конечной даты."""
+    rows = []
+    rows.append([InlineKeyboardButton("%s %d" % (MONTHS_RU[month - 1], year), callback_data="ignore")])
+    rows.append([InlineKeyboardButton(d, callback_data="ignore") for d in WEEKDAYS_RU])
 
-    # Month/Year header
-    month_name = MONTHS_RU[month - 1]
-    keyboard.append([
-        InlineKeyboardButton(f"< {month-1 if month > 1 else 12}", callback_data=f"{prefix}:{datetime(year if month > 1 else year-1, month-1 if month > 1 else 12, 1).strftime('%Y-%m')}"),
-        InlineKeyboardButton(f"{month_name} {year}", callback_data=f"{prefix}:none"),
-        InlineKeyboardButton(f"{month+1 if month < 12 else 1} >", callback_data=f"{prefix}:{datetime(year if month < 12 else year+1, month+1 if month < 12 else 1, 1).strftime('%Y-%m')}")
+    for week in calendar.monthcalendar(year, month):
+        row = []
+        for day in week:
+            if day == 0:
+                row.append(InlineKeyboardButton(" ", callback_data="ignore"))
+            else:
+                row.append(InlineKeyboardButton(
+                    str(day),
+                    callback_data="%s:day:%04d-%02d-%02d" % (prefix, year, month, day),
+                ))
+        rows.append(row)
+
+    prev_month, prev_year = (month - 1, year) if month > 1 else (12, year - 1)
+    next_month, next_year = (month + 1, year) if month < 12 else (1, year + 1)
+    rows.append([
+        InlineKeyboardButton("<", callback_data="%s:nav:%04d-%02d" % (prefix, prev_year, prev_month)),
+        InlineKeyboardButton(">", callback_data="%s:nav:%04d-%02d" % (prefix, next_year, next_month)),
     ])
-
-    # Weekday headers
-    weekday_row = [InlineKeyboardButton(day, callback_data=f"{prefix}:none") for day in WEEKDAYS_RU]
-    keyboard.append(weekday_row)
-
-    # Days
-    first_day = datetime(year, month, 1)
-    start_weekday = first_day.weekday()
-    days_in_month = (datetime(year, month + 1, 1) - timedelta(days=1)).day if month < 12 else 31
-
-    day_row = [InlineKeyboardButton(" ", callback_data=f"{prefix}:none") for _ in range(start_weekday)]
-
-    for day in range(1, days_in_month + 1):
-        date_str = f"{year}-{month:02d}-{day:02d}"
-        day_row.append(InlineKeyboardButton(str(day), callback_data=f"{prefix}:{date_str}"))
-
-        if len(day_row) == 7:
-            keyboard.append(day_row)
-            day_row = []
-
-    if day_row:
-        keyboard.append(day_row)
-
-    return keyboard
+    return InlineKeyboardMarkup(rows)
