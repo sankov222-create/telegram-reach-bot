@@ -1,0 +1,3 @@
+python-telegram-bot==21.4
+apify-client==1.7.1
+python-dotenv==1.0.1
