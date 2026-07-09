@@ -1,194 +1,172 @@
-"""Telegram-бот: охват постов Instagram/TikTok/YouTube за выбранный период.
-
-Сценарий:
-1. /start — бот просит прислать ссылку на профиль (можно несколько, разных площадок).
-2. Пользователь жмёт «Готово» — бот показывает календарь для выбора начальной и конечной даты.
-3. Бот парсит данные через Apify и присылает охват по каждой площадке + топ-4 поста по охвату.
-"""
-import asyncio
 import logging
 import os
-from datetime import date
-
+from datetime import datetime, timedelta
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+
+from scrapers import detect_platform, FETCHERS, PLATFORM_NAMES
+from keyboards import build_calendar
 
 load_dotenv()
 
-from keyboards import build_calendar  # noqa: E402
-from scrapers import FETCHERS, PLATFORM_NAMES, detect_platform  # noqa: E402
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+APIFY_TOKEN = os.getenv("APIFY_TOKEN")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
-logger = logging.getLogger("reach-bot")
-
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-
-DONE_BUTTON = InlineKeyboardMarkup([[InlineKeyboardButton("Готово ✅", callback_data="links_done")]])
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    context.user_data["links"] = {}
-    context.user_data["step"] = "links"
-    await update.message.reply_text(
-        "Привет! Пришлите ссылку на профиль Instagram, TikTok или YouTube.\n\n"
-        "Можно прислать несколько ссылок по очереди (разные площадки одного аккаунта) — "
-        "когда закончите, нажмите «Готово».",
-        reply_markup=DONE_BUTTON,
+    """Start command - ask user for social media links"""
+    context.user_data['links'] = {}
+    context.user_data['current_platform'] = None
+
+    message = (
+        "Привет! 👋\n\n"
+        "Я помогу тебе анализировать охват постов в соцсетях.\n"
+        "Отправь мне ссылки на профили:\n"
+        "• Instagram\n"
+        "• TikTok\n"
+        "• YouTube\n\n"
+        "Отправляй по одной ссылке, потом напиши 'готово'"
     )
+    await update.message.reply_text(message)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    step = context.user_data.get("step")
-    text = (update.message.text or "").strip()
+    """Handle profile links"""
+    text = update.message.text.strip()
 
-    if step != "links":
-        await update.message.reply_text("Сначала выберите даты на календаре выше 🙂 Если нужно начать заново — /start")
+    if text.lower() == 'готово':
+        if not context.user_data.get('links'):
+            await update.message.reply_text("Ты не отправил ни одну ссылку!")
+            return
+
+        await show_date_selector(update, context, 'start')
         return
 
     platform = detect_platform(text)
-    if not platform:
-        await update.message.reply_text("Не распознал ссылку. Пришлите ссылку на Instagram, TikTok или YouTube.")
-        return
-
-    context.user_data["links"][platform] = text
-    await update.message.reply_text(
-        "Добавлено: %s ✅\nПришлите ещё ссылку или нажмите «Готово»." % PLATFORM_NAMES[platform],
-        reply_markup=DONE_BUTTON,
-    )
+    if platform:
+        context.user_data['links'][platform] = text
+        await update.message.reply_text(f"✅ {PLATFORM_NAMES[platform]} добавлен!")
+    else:
+        await update.message.reply_text("❌ Я не распознал ссылку. Попробуй ещё раз.")
 
 
-async def links_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    links = context.user_data.get("links", {})
-    if not links:
-        await query.message.reply_text("Вы не прислали ни одной ссылки. Пришлите ссылку на профиль.")
-        return
+async def show_date_selector(update: Update, context: ContextTypes.DEFAULT_TYPE, selector_type):
+    """Show calendar for date selection"""
+    context.user_data['selector_type'] = selector_type
+    today = datetime.now()
+    keyboard = build_calendar(today.year, today.month, f"{selector_type}:nav")
 
-    context.user_data["step"] = "start_date"
-    today = date.today()
-    await query.message.reply_text(
-        "Выберите НАЧАЛЬНУЮ дату периода:",
-        reply_markup=build_calendar(today.year, today.month, "start"),
-    )
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    if selector_type == 'start':
+        await update.message.reply_text("Выбери начальную дату:", reply_markup=reply_markup)
+    else:
+        await update.message.reply_text("Выбери конечную дату:", reply_markup=reply_markup)
 
 
 async def calendar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle calendar navigation and date selection"""
     query = update.callback_query
-    data = query.data
     await query.answer()
-    if data == "ignore":
+
+    data = query.data
+    selector_type = context.user_data.get('selector_type', 'start')
+
+    if ':nav:' in data:
+        # Navigation between months
+        _, _, date_str = data.split(':')
+        year, month = int(date_str[:4]), int(date_str[5:7])
+        keyboard = build_calendar(year, month, f"{selector_type}:nav")
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_reply_markup(reply_markup=reply_markup)
+
+    elif ':' in data:
+        # Date selection
+        parts = data.split(':')
+        if len(parts) >= 3:
+            date_str = parts[2]
+
+            if selector_type == 'start':
+                context.user_data['start_date'] = datetime.strptime(date_str, "%Y-%m-%d").date()
+                await query.edit_message_text("✅ Начальная дата выбрана!\n\nТеперь выбери конечную дату:")
+                await show_date_selector(query, context, 'end')
+            else:
+                context.user_data['end_date'] = datetime.strptime(date_str, "%Y-%m-%d").date()
+                await query.edit_message_text("✅ Спасибо! Анализирую данные... ⏳")
+                await run_analysis(query, context)
+
+
+async def run_analysis(query, context):
+    """Fetch data from Apify and generate report"""
+    links = context.user_data.get('links', {})
+    start_date = context.user_data.get('start_date')
+    end_date = context.user_data.get('end_date')
+
+    if not start_date or not end_date:
+        await query.edit_message_text("❌ Ошибка при выборе дат")
         return
 
-    prefix, kind, value = data.split(":", 2)
+    report = await format_report(links, start_date, end_date)
 
-    if kind == "nav":
-        year, month = map(int, value.split("-"))
-        await query.edit_message_reply_markup(reply_markup=build_calendar(year, month, prefix))
-        return
-
-    if kind != "day":
-        return
-
-    picked = date.fromisoformat(value)
-
-    if prefix == "start":
-        context.user_data["start_date"] = picked
-        context.user_data["step"] = "end_date"
-        await query.edit_message_text("Начальная дата: %s" % picked.strftime("%d.%m.%Y"))
-        await query.message.reply_text(
-            "Теперь выберите КОНЕЧНУЮ дату периода:",
-            reply_markup=build_calendar(picked.year, picked.month, "end"),
-        )
-        return
-
-    # prefix == "end"
-    start = context.user_data.get("start_date")
-    if not start:
-        await query.message.reply_text("Сначала выберите начальную дату — начните заново: /start")
-        return
-    if picked < start:
-        await query.message.reply_text(
-            "Конечная дата раньше начальной. Выберите ещё раз:",
-            reply_markup=build_calendar(picked.year, picked.month, "end"),
-        )
-        return
-
-    context.user_data["end_date"] = picked
-    await query.edit_message_text("Конечная дата: %s" % picked.strftime("%d.%m.%Y"))
-    await run_analysis(query.message, context)
+    # Split report if too long (Telegram limit 4096 chars)
+    if len(report) > 4000:
+        chunks = [report[i:i+4000] for i in range(0, len(report), 4000)]
+        for chunk in chunks:
+            await query.message.reply_text(chunk)
+    else:
+        await query.edit_message_text(report)
 
 
-async def run_analysis(message, context: ContextTypes.DEFAULT_TYPE):
-    links = dict(context.user_data["links"])
-    start = context.user_data["start_date"]
-    end = context.user_data["end_date"]
-    context.user_data["step"] = "processing"
-
-    await message.reply_text(
-        "Собираю данные с %s по %s для %d площадок(и)... Это может занять пару минут ⏳"
-        % (start.strftime("%d.%m.%Y"), end.strftime("%d.%m.%Y"), len(links))
-    )
+async def format_report(links, start_date, end_date):
+    """Generate analysis report"""
+    report = f"📊 Анализ охвата ({start_date} — {end_date})\n\n"
 
     for platform, url in links.items():
-        try:
-            fetcher = FETCHERS[platform]
-            posts = await asyncio.to_thread(fetcher, url, start, end)
-        except Exception:
-            logger.exception("fetch failed for %s", platform)
-            await message.reply_text("⚠️ Не удалось собрать данные %s. Попробуйте позже." % PLATFORM_NAMES[platform])
+        fetcher = FETCHERS.get(platform)
+        if not fetcher:
             continue
-        await message.reply_text(format_report(platform, posts), disable_web_page_preview=True)
 
-    context.user_data["step"] = None
-    await message.reply_text("Готово! Чтобы посчитать ещё раз — /start")
+        try:
+            posts = await fetcher(url, start_date, end_date)
+            if not posts:
+                report += f"\n❌ {PLATFORM_NAMES[platform]}: нет данных\n"
+                continue
 
+            total_reach = sum(p.get('reach', 0) for p in posts)
+            avg_reach = total_reach / len(posts) if posts else 0
 
-def _fmt_num(n) -> str:
-    return "{:,}".format(int(n)).replace(",", " ")
+            report += f"\n📱 {PLATFORM_NAMES[platform]}\n"
+            report += f"Постов: {len(posts)}\n"
+            report += f"Общий охват: {_fmt_num(total_reach)}\n"
+            report += f"Средний: {_fmt_num(int(avg_reach))}\n\n"
+            report += "Топ-4 по охватам:\n"
 
+            top_posts = sorted(posts, key=lambda p: p.get('reach', 0), reverse=True)[:4]
+            for i, post in enumerate(top_posts, 1):
+                title = post.get('title', 'Пост без названия')[:30]
+                reach = _fmt_num(post.get('reach', 0))
+                report += f"{i}. {title}... — {reach}\n"
 
-def format_report(platform: str, posts: list) -> str:
-    name = PLATFORM_NAMES[platform]
-    if not posts:
-        return "%s\nЗа выбранный период публикаций не найдено." % name
+        except Exception as e:
+            report += f"\n❌ {PLATFORM_NAMES[platform]}: {str(e)[:50]}\n"
 
-    total_views = sum(p["views"] for p in posts)
-    avg_views = total_views / len(posts)
-
-    lines = [
-        name,
-        "Постов: %d" % len(posts),
-        "Суммарный охват: %s" % _fmt_num(total_views),
-        "Средний охват: %s" % _fmt_num(avg_views),
-        "",
-        "Топ-4 по охвату:",
-    ]
-    top4 = sorted(posts, key=lambda p: p["views"], reverse=True)[:4]
-    for i, p in enumerate(top4, 1):
-        lines.append("%d. %s — %s просмотров\n%s" % (i, p["date"], _fmt_num(p["views"]), p["url"]))
-
-    return "\n".join(lines)
+    return report
 
 
-def main():
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(links_done, pattern="^links_done$"))
-    app.add_handler(CallbackQueryHandler(calendar_callback, pattern="^(start|end):"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    logger.info("Bot started")
-    app.run_polling()
+def _fmt_num(n):
+    """Format number with spaces"""
+    return f"{n:,}".replace(",", " ")
 
 
 if __name__ == "__main__":
-    main()
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(calendar_callback))
+
+    logger.info("Bot started")
+    app.run_polling()
